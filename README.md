@@ -1,8 +1,8 @@
-python -m venv .venv
+python 3.9:
 
-.venv\Scripts\activate
+1: `python -m venv .venv`
 
-pip install playwright bs4 lxml requests
-playwright install
+2: `.venv\Scripts\activate`
 
-pip install pyautogui keyboard
+3: `pip install -r requirements.txt`
+4: `playwright install`
