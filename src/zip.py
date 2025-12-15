@@ -11,6 +11,9 @@ import time
 import keyboard
 import pyautogui
 
+from utils import fetch_rendered_board_html, FetchOptions
+
+
 URL = "https://www.linkedin.com/games/zip"
 
 Coord = Tuple[int, int]
@@ -23,35 +26,6 @@ DEBUG_DIR.mkdir(exist_ok=True)
 def _ts():
     return datetime.now().strftime("%Y%m%d-%H%M%S-%f")
 
-async def _dump_frames(page, tag="frames"):
-    print(f"[DBG] dumping frame tree: {tag}")
-    lines = []
-    for i, fr in enumerate(page.frames):
-        url = fr.url
-        try:
-            snippet = await fr.evaluate("() => document.body?.innerText?.slice(0,400) || ''")
-        except Exception:
-            snippet = "(no body)"
-        clean_snippet = snippet.replace('\n', ' ')[:200]
-        lines.append(f"[{i}] {url}\n  {clean_snippet}…")
-    out = "\n".join(lines)
-    (DEBUG_DIR / f"{_ts()}_{tag}_frames.txt").write_text(out, encoding="utf-8")
-    print(out)
-
-async def _click_any(page_or_frame, labels):
-    for txt in labels:
-        sel = f"button:has-text('{txt}')"
-        try:
-            el = await page_or_frame.query_selector(sel)
-            if el:
-                await el.scroll_into_view_if_needed()
-                await el.click(timeout=2000)
-                return sel
-        except Exception:
-            pass
-    return None
-
-# HTML -> grid/barriers parser
 def parse_board(html: str):
     soup = BeautifulSoup(html, "lxml")
     board = soup.select_one(".trail-grid.grid-game-board.gil__grid") or \
@@ -101,7 +75,6 @@ def parse_board(html: str):
 
     return grid, barriers, rows, cols
 
-# ASCII renderer
 def render_ascii(grid, barriers, rows: int, cols: int) -> str:
     def blocked(a, b) -> bool:
         return frozenset((a, b)) in barriers
@@ -129,133 +102,6 @@ def render_ascii(grid, barriers, rows: int, cols: int) -> str:
                 canvas[cy+1][cx] = "─"
 
     return "\n".join("".join(row) for row in canvas)
-
-# open launcher
-# accept cookies (if present)
-# click "Start" (button text can vary)
-# wait for iframe -> board
-# extract board outerHTML and parse
-async def fetch_rendered_board_html(url: str) -> str:
-    async with async_playwright() as pw:
-        # TIP: set headless=False and slow_mo=150 if you want to watch
-        browser = await pw.chromium.launch(headless=True)
-        ctx = await browser.new_context(
-            locale="en-US",
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/120.0 Safari/537.36"),
-        )
-        page = await ctx.new_page()
-        try:
-            print("[STEP] goto launcher")
-            await page.goto(url, wait_until="domcontentloaded")
-            if DEBUG:
-                await page.screenshot(path=DEBUG_DIR / f"{_ts()}_01_after_goto.png", full_page=True)
-            await _dump_frames(page, "after_goto")
-
-            # 1) Cookie banner (don’t wait for networkidle; just try a few common labels)
-            print("[STEP] try cookie accept")
-            cookie_clicked = await _click_any(page, [
-                "Accept", "I accept", "Accepteren", "OK",
-            ])
-            if cookie_clicked:
-                print(f"[DBG] cookie clicked via {cookie_clicked}")
-            if DEBUG:
-                await page.screenshot(path=DEBUG_DIR / f"{_ts()}_02_after_cookie.png", full_page=True)
-
-            # 2) Find launcher iframe (if it exists)
-            print("[STEP] find launcher iframe")
-            frame = None
-            try:
-                iframe_el = await page.wait_for_selector("iframe.game-launch-page__iframe", timeout=8000)
-                frame = await iframe_el.content_frame()
-            except PWTimeout:
-                pass
-            if frame is None:
-                frame = page.main_frame
-            await _dump_frames(page, "after_iframe")
-
-            # 3) Click Start/Play (try inside frame first, then page). No networkidle waits.
-            print("[STEP] click Start")
-            start_label = await _click_any(frame, [
-                "Start game", "Start", "Play", "Play now", "Continue", "Begin",
-                "Starten", "Doorgaan"
-            ]) or await _click_any(page, [
-                "Start game", "Start", "Play", "Play now", "Continue", "Begin",
-                "Starten", "Doorgaan"
-            ])
-            if start_label:
-                print(f"[DBG] start clicked via {start_label}")
-            if DEBUG:
-                await page.screenshot(path=DEBUG_DIR / f"{_ts()}_03_after_start.png", full_page=True)
-
-            # 4) Find the board in ANY frame; accept hidden (attached) elements
-            print("[STEP] search board in frames")
-            board_sel = ".trail-grid.grid-game-board, .trail-grid"
-            board_handle = None
-            board_frame = None
-            # Retry for ~9s total
-            for _ in range(30):
-                for fr in page.frames:
-                    try:
-                        h = await fr.query_selector(board_sel)
-                        if h:
-                            board_handle = h
-                            board_frame = fr
-                            break
-                    except Exception:
-                        pass
-                if board_handle:
-                    break
-                await page.wait_for_timeout(300)
-
-            if not board_handle:
-                # last attempt: if we had a distinct frame earlier, also try state="attached" there
-                try:
-                    await frame.wait_for_selector(board_sel, state="attached", timeout=3000)
-                    board_handle = await frame.query_selector(board_sel)
-                    board_frame = frame if board_handle else None
-                except Exception:
-                    pass
-
-            if not board_handle:
-                await _dump_frames(page, "before_fail")
-                # Save HTML of each frame for post-mortem
-                for i, fr in enumerate(page.frames):
-                    try:
-                        html = await fr.content()
-                        if DEBUG:
-                            (DEBUG_DIR / f"{_ts()}_frame_{i}.html").write_text(html, encoding="utf-8")
-                    except Exception:
-                        pass
-                await page.screenshot(path=DEBUG_DIR / f"{_ts()}_04_fail.png", full_page=True)
-                raise RuntimeError("Board not found (likely still behind Start overlay).")
-
-            # Optional: element screenshot (may fail if offscreen/hidden)
-            try:
-                await board_handle.screenshot(path=DEBUG_DIR / f"{_ts()}_05_board_elem.png")
-            except Exception:
-                pass
-
-            # 5) Extract just the board’s HTML
-            board_html = await board_handle.evaluate("el => el.outerHTML")
-            if DEBUG:
-                (DEBUG_DIR / f"{_ts()}_board.html").write_text(board_html, encoding="utf-8")
-            print("[OK] board HTML extracted")
-            return board_html
-
-        finally:
-            # always close cleanly
-            try:
-                if DEBUG:
-                    await page.screenshot(path=DEBUG_DIR / f"{_ts()}_99_final.png", full_page=True)
-                else:
-                    pass
-            except Exception:
-                pass
-            await page.close()
-            await ctx.close()
-            await browser.close()
 
 def find_number_positions(grid: List[List[Optional[int]]]) -> Dict[int, Coord]:
     pos: Dict[int, Coord] = {}
@@ -427,10 +273,22 @@ def wait_and_play_arrows(arrows: str, delay: float = 0.15):
     print("Done executing arrow sequence.")
 
 if __name__ == "__main__":
-    # try headless browser to get the live, rendered board
-    board_html = asyncio.run(fetch_rendered_board_html(URL))
+    # NEW: board extraction via helper
+    zip_board_selectors = [
+        ".trail-grid.grid-game-board",
+        ".trail-grid"
+    ]
 
-    # parse and render
+    board_html = asyncio.run(
+        fetch_rendered_board_html(
+            URL,
+            board_identifier=zip_board_selectors,
+            options=FetchOptions(headless=True),
+            debug=DEBUG,
+        )
+    )
+
+    # Zip-specific parse + solve pipeline
     grid, barriers, rows, cols = parse_board(board_html)
     print(f"Board size: {rows} x {cols}")
     print("Grid preview:")
@@ -443,4 +301,3 @@ if __name__ == "__main__":
 
     path, flow_grid, arrows = solve_and_render(grid, barriers, rows, cols)
     wait_and_play_arrows(arrows, delay=0.001)
-
